@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth.js';
 import { userStore } from '../models/userStore.js';
+import { isValidCurrency, SUPPORTED_CURRENCIES } from '../config/currencies.js';
 
 const router = Router();
 
@@ -13,7 +14,7 @@ function isValidPhone(phone: string): boolean {
 
 /**
  * GET /api/users/profile
- * Returns authenticated user's profile: id, name, email, accountType, phone, createdAt.
+ * Returns authenticated user's profile: id, name, email, accountType, phone, currency, createdAt.
  * Sensitive fields (password, passwordHash, secrets) are NEVER returned.
  */
 router.get('/profile', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
@@ -52,7 +53,7 @@ router.get('/profile', authenticateToken, async (req: AuthenticatedRequest, res:
 
 /**
  * PUT /api/users/profile
- * Updates authenticated user's profile: name and phone.
+ * Updates authenticated user's profile: name, phone, and currency.
  * Email and accountType remain strictly read-only.
  */
 router.put('/profile', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
@@ -65,17 +66,17 @@ router.put('/profile', authenticateToken, async (req: AuthenticatedRequest, res:
       });
     }
 
-    const { name, phone } = req.body;
+    const { name, phone, currency } = req.body;
 
     // Check if at least one updatable field is provided
-    if (name === undefined && phone === undefined) {
+    if (name === undefined && phone === undefined && currency === undefined) {
       return res.status(400).json({
         success: false,
-        message: 'At least one field (name or phone) is required to update profile'
+        message: 'At least one field (name, phone, or currency) is required to update profile'
       });
     }
 
-    const updates: { name?: string; phone?: string } = {};
+    const updates: { name?: string; phone?: string; currency?: string } = {};
 
     // Validate Name if provided
     if (name !== undefined) {
@@ -110,6 +111,17 @@ router.put('/profile', authenticateToken, async (req: AuthenticatedRequest, res:
         });
       }
       updates.phone = trimmedPhone;
+    }
+
+    // Validate Currency if provided
+    if (currency !== undefined) {
+      if (typeof currency !== 'string' || !isValidCurrency(currency)) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid currency code. Supported currencies: ${SUPPORTED_CURRENCIES.map((c) => c.code).join(', ')}`
+        });
+      }
+      updates.currency = currency.trim().toUpperCase();
     }
 
     const updatedUser = await userStore.updateProfile(userId, updates);

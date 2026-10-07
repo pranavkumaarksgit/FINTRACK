@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import { UserResponse } from '../models/userStore.js';
+import { UserResponse, userStore } from '../models/userStore.js';
 
 export interface AuthenticatedRequest extends Request {
   user?: UserResponse;
@@ -32,7 +32,31 @@ export function authenticateToken(
   const secretKey = process.env.JWT_SECRET_KEY || 'fintrack_default_jwt_secret_dev';
 
   try {
-    const decoded = jwt.verify(token, secretKey) as UserResponse;
+    const decoded = jwt.verify(token, secretKey) as any;
+
+    // Invalidate existing sessions/tokens after password reset
+    if (decoded && decoded.id) {
+      const user = userStore.findByIdSync(decoded.id);
+      if (user) {
+        // If JWT contains tokenVersion and doesn't match current user version, session is invalidated
+        if (decoded.tokenVersion !== undefined && user.tokenVersion !== undefined) {
+          if (decoded.tokenVersion !== user.tokenVersion) {
+            return res.status(401).json({
+              success: false,
+              message: 'Session has expired due to password reset. Please log in again.'
+            });
+          }
+        } else if (user.passwordChangedAt && decoded.iat) {
+          if (decoded.iat * 1000 <= user.passwordChangedAt) {
+            return res.status(401).json({
+              success: false,
+              message: 'Session has expired due to password reset. Please log in again.'
+            });
+          }
+        }
+      }
+    }
+
     req.user = decoded;
     next();
   } catch (error: any) {

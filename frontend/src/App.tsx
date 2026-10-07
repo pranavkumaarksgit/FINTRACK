@@ -2,6 +2,12 @@ import React, { useState, useEffect } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import {
+  SUPPORTED_CURRENCIES,
+  DEFAULT_CURRENCY,
+  formatCurrency,
+  getCurrencyConfig
+} from './utils/currency';
+import {
   api,
   checkHealth,
   HealthCheckResponse,
@@ -81,7 +87,8 @@ import {
   Clock,
   Tag,
   CheckCheck,
-  Inbox
+  Inbox,
+  KeyRound
 } from 'lucide-react';
 import { INITIAL_TRANSACTIONS, INITIAL_MESSAGES } from './data';
 import { TabType, Transaction, ChatMessage, Budget } from './types';
@@ -114,9 +121,20 @@ function formatRelativeTime(isoStr: string): string {
   }
 }
 
+// Module-scoped deduplication sets to survive React StrictMode mount/unmount/remount cycles
+const verifiedTokensSession = new Set<string>();
+const inFlightTokensSession = new Set<string>();
+
 export default function App() {
   const [currentTab, setCurrentTab] = useState<TabType>('dashboard');
-  const [authMode, setAuthMode] = useState<'app' | 'welcome' | 'login'>(() => {
+  const [authMode, setAuthMode] = useState<'app' | 'welcome' | 'login' | 'forgot-password' | 'reset-password' | 'verify-email'>(() => {
+    if (typeof window !== 'undefined') {
+      const pathname = window.location.pathname;
+      if (pathname === '/forgot-password') return 'forgot-password';
+      if (pathname === '/reset-password') return 'reset-password';
+      if (pathname === '/verify-email') return 'verify-email';
+      if (pathname === '/login') return 'login';
+    }
     return getStoredToken() ? 'app' : 'welcome';
   });
   const [accountType, setAccountType] = useState<'Individual' | 'Corporate'>('Individual');
@@ -138,8 +156,125 @@ export default function App() {
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isRegistering, setIsRegistering] = useState(false);
   const [registerName, setRegisterName] = useState('');
+  const [registeredEmailNotice, setRegisteredEmailNotice] = useState<string | null>(null);
+  const [unverifiedLoginEmail, setUnverifiedLoginEmail] = useState<string | null>(null);
 
-  // User Profile State (Step 3)
+  // Forgot Password Form State (Step 13)
+  const [forgotEmail, setForgotEmail] = useState('');
+  const [forgotLoading, setForgotLoading] = useState(false);
+  const [forgotError, setForgotError] = useState<string | null>(null);
+  const [forgotSuccess, setForgotSuccess] = useState<string | null>(null);
+  const [devResetToken, setDevResetToken] = useState<string | null>(null);
+
+  // Reset Password Form State (Step 13)
+  const [resetToken, setResetToken] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return new URLSearchParams(window.location.search).get('token') || '';
+    }
+    return '';
+  });
+  const [resetNewPassword, setResetNewPassword] = useState('');
+  const [resetConfirmPassword, setResetConfirmPassword] = useState('');
+  const [showResetPassword, setShowResetPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const [resetSuccess, setResetSuccess] = useState<string | null>(null);
+
+  // Email Verification State
+  const [verificationStatus, setVerificationStatus] = useState<'idle' | 'verifying' | 'success' | 'error'>('idle');
+  const [verificationMessage, setVerificationMessage] = useState<string>('');
+  const [resendEmail, setResendEmail] = useState('');
+  const [resendLoading, setResendLoading] = useState(false);
+  const [resendSuccess, setResendSuccess] = useState<string | null>(null);
+  const [resendError, setResendError] = useState<string | null>(null);
+
+  // Synchronize browser history and path for /forgot-password, /reset-password, /verify-email, /login
+  const navigateAuth = (
+    path: string,
+    mode: 'app' | 'welcome' | 'login' | 'forgot-password' | 'reset-password' | 'verify-email'
+  ) => {
+    if (typeof window !== 'undefined') {
+      window.history.pushState({}, '', path);
+    }
+    setAuthMode(mode);
+  };
+
+  const runEmailVerification = async (tokenToVerify: string) => {
+    const cleanToken = (tokenToVerify || '').trim();
+    if (!cleanToken) {
+      setVerificationStatus('error');
+      setVerificationMessage('This verification link is invalid or has expired.');
+      return;
+    }
+
+    // If this token was already verified in this session, keep success status
+    if (verifiedTokensSession.has(cleanToken)) {
+      setVerificationStatus('success');
+      setVerificationMessage('Email verified successfully. You can now sign in.');
+      return;
+    }
+
+    // Guard against duplicate concurrent calls (e.g., React StrictMode double effect execution)
+    if (inFlightTokensSession.has(cleanToken)) {
+      return;
+    }
+
+    inFlightTokensSession.add(cleanToken);
+    setVerificationStatus('verifying');
+
+    try {
+      const res = await authApi.verifyEmail(cleanToken);
+      verifiedTokensSession.add(cleanToken);
+      setVerificationStatus('success');
+      setVerificationMessage(res.message || 'Email verified successfully. You can now sign in.');
+      triggerToast('Email verified successfully!');
+    } catch (err: any) {
+      // Only set error if not already successfully verified
+      if (!verifiedTokensSession.has(cleanToken)) {
+        setVerificationStatus('error');
+        setVerificationMessage(err.message || 'This verification link is invalid or has expired.');
+      }
+    } finally {
+      inFlightTokensSession.delete(cleanToken);
+    }
+  };
+
+  useEffect(() => {
+    const handleUrlRouting = () => {
+      const pathname = window.location.pathname;
+      const searchParams = new URLSearchParams(window.location.search);
+      const token = searchParams.get('token');
+
+      if (pathname === '/forgot-password') {
+        setAuthMode('forgot-password');
+        setForgotError(null);
+      } else if (pathname === '/reset-password') {
+        setAuthMode('reset-password');
+        if (token) setResetToken(token);
+        setResetError(null);
+        setResetSuccess(null);
+      } else if (pathname === '/verify-email') {
+        setAuthMode('verify-email');
+        if (token) {
+          runEmailVerification(token);
+        } else {
+          setVerificationStatus('error');
+          setVerificationMessage('No verification token provided in the link. Please open the link sent to your email.');
+        }
+      } else if (pathname === '/login') {
+        setAuthMode('login');
+      } else if (getStoredToken()) {
+        setAuthMode('app');
+      }
+    };
+
+    handleUrlRouting();
+    window.addEventListener('popstate', handleUrlRouting);
+    return () => window.removeEventListener('popstate', handleUrlRouting);
+  }, []);
+
+  // User Profile State (Step 3 & Currency Preference)
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSaving, setProfileSaving] = useState(false);
@@ -147,6 +282,20 @@ export default function App() {
   const [profileSuccess, setProfileSuccess] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editPhone, setEditPhone] = useState('');
+  const [preferredCurrency, setPreferredCurrency] = useState<string>(() => {
+    try {
+      return localStorage.getItem('fintrack_currency_preference') || DEFAULT_CURRENCY;
+    } catch {
+      return DEFAULT_CURRENCY;
+    }
+  });
+  const [editCurrency, setEditCurrency] = useState<string>(() => {
+    try {
+      return localStorage.getItem('fintrack_currency_preference') || DEFAULT_CURRENCY;
+    } catch {
+      return DEFAULT_CURRENCY;
+    }
+  });
 
   // Fetch authenticated user profile
   const loadProfile = async () => {
@@ -164,6 +313,12 @@ export default function App() {
         setProfile(userProfile);
         setEditName(userProfile.name);
         setEditPhone(userProfile.phone || '');
+        const curr = userProfile.currency || DEFAULT_CURRENCY;
+        setPreferredCurrency(curr);
+        setEditCurrency(curr);
+        try {
+          localStorage.setItem('fintrack_currency_preference', curr);
+        } catch {}
         if (userProfile.accountType) {
           setAccountType(userProfile.accountType === 'corporate' ? 'Corporate' : 'Individual');
         }
@@ -181,7 +336,29 @@ export default function App() {
     }
   };
 
-  // Save profile updates (name & phone only)
+  // Quick Currency Change (Dashboard & Header Selector)
+  const handleQuickCurrencyChange = async (newCurrency: string) => {
+    const trimmed = newCurrency.trim().toUpperCase();
+    if (trimmed === preferredCurrency) return;
+    setPreferredCurrency(trimmed);
+    setEditCurrency(trimmed);
+    try {
+      localStorage.setItem('fintrack_currency_preference', trimmed);
+    } catch {}
+    try {
+      const res = await userApi.updateProfile({ currency: trimmed });
+      const updated = res.profile || res.data;
+      if (updated) {
+        setProfile(updated);
+        triggerToast(`Currency updated to ${trimmed}!`);
+      }
+    } catch (err: any) {
+      console.error('[Quick Currency Update Error]:', err);
+      triggerToast('Failed to save currency preference to server');
+    }
+  };
+
+  // Save profile updates (name, phone, currency)
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editName || editName.trim().length < 2) {
@@ -195,12 +372,19 @@ export default function App() {
       const res = await userApi.updateProfile({
         name: editName.trim(),
         phone: editPhone.trim(),
+        currency: editCurrency,
       });
       const updated = res.profile || res.data;
       if (updated) {
         setProfile(updated);
         setEditName(updated.name);
         setEditPhone(updated.phone || '');
+        const curr = updated.currency || DEFAULT_CURRENCY;
+        setPreferredCurrency(curr);
+        setEditCurrency(curr);
+        try {
+          localStorage.setItem('fintrack_currency_preference', curr);
+        } catch {}
         setProfileSuccess('Profile details saved successfully!');
         triggerToast('Profile updated successfully!');
         setTimeout(() => setProfileSuccess(null), 4000);
@@ -225,6 +409,7 @@ export default function App() {
     e.preventDefault();
     setLoginLoading(true);
     setLoginError(null);
+    setUnverifiedLoginEmail(null);
     try {
       const res = await authApi.login({
         email: loginEmail.trim(),
@@ -241,13 +426,19 @@ export default function App() {
       loadNotifications();
     } catch (err: any) {
       console.error('[Login Error]:', err);
-      setLoginError(err.message || 'Invalid email or password. Please try again.');
+      if (err.status === 403 || err.data?.requiresVerification) {
+        setUnverifiedLoginEmail(loginEmail.trim());
+        setResendEmail(loginEmail.trim());
+        setLoginError(err.message || 'Please verify your email address before signing in.');
+      } else {
+        setLoginError(err.message || 'Invalid email or password. Please try again.');
+      }
     } finally {
       setLoginLoading(false);
     }
   };
 
-  // Registration handler connected to authApi (Step 12)
+  // Registration handler connected to authApi (Step 12 & Email Verification)
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!registerName.trim()) {
@@ -257,25 +448,112 @@ export default function App() {
     setLoginLoading(true);
     setLoginError(null);
     try {
-      const res = await authApi.register({
+      const emailUsed = loginEmail.trim();
+      await authApi.register({
         name: registerName.trim(),
-        email: loginEmail.trim(),
+        email: emailUsed,
         password: loginPassword,
         accountType: (accountType.toLowerCase() as 'individual' | 'corporate')
       });
-      triggerToast(`Account created! Welcome to FINTRACK, ${res.user.name}!`);
-      setAuthMode('app');
-      loadProfile();
-      loadTransactions();
-      loadDashboardSummary();
-      loadAnalytics();
-      loadBudgets();
-      loadNotifications();
+      setRegisteredEmailNotice(emailUsed);
+      setResendEmail(emailUsed);
+      setIsRegistering(false);
+      triggerToast('Account created! Verification link sent to your email.');
     } catch (err: any) {
       console.error('[Register Error]:', err);
       setLoginError(err.message || 'Registration failed. Please check your inputs.');
     } finally {
       setLoginLoading(false);
+    }
+  };
+
+  // Resend Verification Email handler
+  const handleResendVerification = async (e?: React.FormEvent, directEmail?: string) => {
+    if (e) e.preventDefault();
+    const targetEmail = (directEmail || resendEmail || unverifiedLoginEmail || loginEmail || '').trim();
+    if (!targetEmail) {
+      setResendError('Please enter a valid email address.');
+      return;
+    }
+    setResendLoading(true);
+    setResendError(null);
+    setResendSuccess(null);
+    try {
+      const res = await authApi.resendVerification(targetEmail);
+      setResendSuccess(res.message || 'Verification link has been sent to your email.');
+      triggerToast('Verification email sent!');
+    } catch (err: any) {
+      setResendError(err.message || 'Failed to send verification email.');
+    } finally {
+      setResendLoading(false);
+    }
+  };
+
+  // Forgot Password submission handler (Step 13)
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = forgotEmail.trim();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!trimmed || !emailRegex.test(trimmed)) {
+      setForgotError('Please enter a valid email address.');
+      return;
+    }
+
+    setForgotLoading(true);
+    setForgotError(null);
+    setForgotSuccess(null);
+    setDevResetToken(null);
+
+    try {
+      const res = await authApi.forgotPassword(trimmed);
+      setForgotSuccess(res.message || 'If an account exists for this email, you will receive password reset instructions.');
+      if (res._devResetToken || res.resetToken) {
+        setDevResetToken(res._devResetToken || res.resetToken);
+      }
+    } catch (err: any) {
+      console.error('[Forgot Password Error]:', err);
+      // Consistent generic response to prevent email enumeration
+      setForgotSuccess('If an account exists for this email, you will receive password reset instructions.');
+    } finally {
+      setForgotLoading(false);
+    }
+  };
+
+  // Reset Password submission handler (Step 13)
+  const handleResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resetToken.trim()) {
+      setResetError('Password reset token is missing. Please use the link sent to your email.');
+      return;
+    }
+    if (!resetNewPassword) {
+      setResetError('Please enter a new password.');
+      return;
+    }
+    if (resetNewPassword.length < 6) {
+      setResetError('Password must be at least 6 characters long.');
+      return;
+    }
+    if (resetNewPassword !== resetConfirmPassword) {
+      setResetError('Passwords do not match. Please ensure both passwords match.');
+      return;
+    }
+
+    setResetLoading(true);
+    setResetError(null);
+    setResetSuccess(null);
+
+    try {
+      const res = await authApi.resetPassword(resetToken.trim(), resetNewPassword);
+      setResetSuccess(res.message || 'Password has been reset successfully. You can now log in with your new password.');
+      setResetNewPassword('');
+      setResetConfirmPassword('');
+      triggerToast('Password reset successfully!');
+    } catch (err: any) {
+      console.error('[Reset Password Error]:', err);
+      setResetError(err.message || 'Invalid or expired password reset token.');
+    } finally {
+      setResetLoading(false);
     }
   };
 
@@ -973,9 +1251,9 @@ export default function App() {
         body: [
           [
             `Total Records: ${filteredTransactions.length}`,
-            `Total Inflow: INR ${filteredIncomeTotal.toLocaleString('en-IN')}`,
-            `Total Outflow: INR ${filteredExpenseTotal.toLocaleString('en-IN')}`,
-            `Net Balance: INR ${filteredNetBalance.toLocaleString('en-IN')}`
+            `Total Inflow: ${formatCurrency(filteredIncomeTotal, preferredCurrency)}`,
+            `Total Outflow: ${formatCurrency(filteredExpenseTotal, preferredCurrency)}`,
+            `Net Balance: ${formatCurrency(filteredNetBalance, preferredCurrency)}`
           ]
         ],
         styles: { fontSize: 8.5, fontStyle: 'bold', textColor: [30, 41, 59] }
@@ -988,7 +1266,7 @@ export default function App() {
         t.category || 'Uncategorized',
         t.paymentMethod || t.method || 'Other',
         t.type.toUpperCase(),
-        `${t.type === 'income' ? '+' : '-'} INR ${t.amount.toLocaleString('en-IN')}`
+        `${t.type === 'income' ? '+' : '-'}${formatCurrency(t.amount, preferredCurrency)}`
       ]);
 
       autoTable(doc, {
@@ -1131,7 +1409,7 @@ export default function App() {
         description: description.trim()
       });
 
-      triggerToast(`Successfully recorded ₹${parsedAmount.toLocaleString('en-IN')} ${txType}!`);
+      triggerToast(`Successfully recorded ${formatCurrency(parsedAmount, preferredCurrency)} ${txType}!`);
       setAmount('');
       setDescription('');
       setCustomCategory('');
@@ -1430,6 +1708,447 @@ export default function App() {
                   </button>
                 </div>
               </div>
+            ) : authMode === 'forgot-password' ? (
+              <div className="flex flex-col gap-6 animate-fadeIn bg-white/5 backdrop-blur-2xl p-8 rounded-3xl border border-white/10 shadow-2xl">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForgotError(null);
+                    setForgotSuccess(null);
+                    navigateAuth('/login', 'login');
+                  }}
+                  className="flex items-center gap-1.5 text-slate-400 hover:text-white text-xs font-mono transition-colors self-start cursor-pointer"
+                >
+                  ← Back to Sign In
+                </button>
+
+                <div className="flex items-center gap-3.5">
+                  <div className="w-11 h-11 rounded-2xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center justify-center shrink-0 shadow-lg shadow-emerald-500/10">
+                    <KeyRound className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white mb-0.5">Forgot Password</h2>
+                    <p className="text-xs text-slate-400">Request password reset instructions for your account.</p>
+                  </div>
+                </div>
+
+                {forgotSuccess ? (
+                  <div className="flex flex-col gap-5">
+                    <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs px-4 py-3.5 rounded-xl flex items-start gap-3">
+                      <CheckCircle2 className="w-5 h-5 shrink-0 text-emerald-400 mt-0.5" />
+                      <div className="leading-relaxed">
+                        <p className="font-semibold text-emerald-200 mb-1">Request Received</p>
+                        <p>{forgotSuccess}</p>
+                      </div>
+                    </div>
+
+                    {devResetToken && (
+                      <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex flex-col gap-2">
+                        <div className="flex items-center gap-2 font-mono font-bold text-[11px] uppercase tracking-wider text-amber-400">
+                          <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Development Prototype Shortcut</span>
+                        </div>
+                        <p className="text-[11px] text-amber-200/80 leading-relaxed">
+                          Before Nodemailer integration in Step 14, you can test the password reset flow directly using this generated dev token:
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setResetToken(devResetToken);
+                            setResetError(null);
+                            setResetSuccess(null);
+                            navigateAuth(`/reset-password?token=${devResetToken}`, 'reset-password');
+                          }}
+                          className="w-full bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 rounded-xl py-2.5 px-3 text-xs font-mono font-semibold transition-all cursor-pointer flex items-center justify-center gap-2"
+                        >
+                          <span>Open Reset Password Form with Token →</span>
+                        </button>
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setForgotSuccess(null);
+                        navigateAuth('/login', 'login');
+                      }}
+                      className="w-full bg-white/10 hover:bg-white/15 text-white rounded-xl py-3 px-4 font-mono text-xs uppercase tracking-wider font-semibold transition-all cursor-pointer border border-white/10 text-center"
+                    >
+                      Return to Sign In
+                    </button>
+                  </div>
+                ) : (
+                  <form onSubmit={handleForgotPassword} className="flex flex-col gap-4">
+                    {forgotError && (
+                      <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs px-4 py-3 rounded-xl flex items-center gap-2.5">
+                        <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                        <span>{forgotError}</span>
+                      </div>
+                    )}
+
+                    <p className="text-xs text-slate-300 leading-relaxed">
+                      Enter your registered email address below. We'll send single-use instructions to securely reset your credentials.
+                    </p>
+
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-mono uppercase tracking-wider text-slate-400">Email Address</label>
+                      <input
+                        type="email"
+                        required
+                        value={forgotEmail}
+                        onChange={(e) => setForgotEmail(e.target.value)}
+                        placeholder="alex.morgan@fintrack.io"
+                        className="w-full bg-white/5 border border-white/15 rounded-xl px-4 py-3 text-white placeholder:text-slate-500 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 outline-none backdrop-blur-md text-sm"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={forgotLoading}
+                      className="w-full bg-gradient-to-r from-indigo-600 via-emerald-600 to-teal-600 hover:from-indigo-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl py-3 px-4 font-mono text-xs uppercase tracking-wider font-bold transition-all shadow-lg shadow-emerald-500/20 cursor-pointer mt-2 border border-white/10 flex items-center justify-center gap-2"
+                    >
+                      {forgotLoading ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          <span>Processing Request...</span>
+                        </>
+                      ) : (
+                        <span>Send Password Reset Instructions</span>
+                      )}
+                    </button>
+
+                    <div className="pt-2 text-center">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setForgotError(null);
+                          navigateAuth('/login', 'login');
+                        }}
+                        className="text-xs font-mono text-slate-400 hover:text-white transition-colors cursor-pointer"
+                      >
+                        Remember your password? <span className="text-emerald-400 hover:underline">Sign In</span>
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            ) : authMode === 'reset-password' ? (
+              <div className="flex flex-col gap-6 animate-fadeIn bg-white/5 backdrop-blur-2xl p-8 rounded-3xl border border-white/10 shadow-2xl">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setResetError(null);
+                    setResetSuccess(null);
+                    navigateAuth('/login', 'login');
+                  }}
+                  className="flex items-center gap-1.5 text-slate-400 hover:text-white text-xs font-mono transition-colors self-start cursor-pointer"
+                >
+                  ← Back to Sign In
+                </button>
+
+                <div className="flex items-center gap-3.5">
+                  <div className="w-11 h-11 rounded-2xl bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 flex items-center justify-center shrink-0 shadow-lg shadow-indigo-500/10">
+                    <Lock className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white mb-0.5">Reset Password</h2>
+                    <p className="text-xs text-slate-400">Establish a new password for your account.</p>
+                  </div>
+                </div>
+
+                {resetSuccess ? (
+                  <div className="flex flex-col gap-5">
+                    <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs px-4 py-3.5 rounded-xl flex items-start gap-3">
+                      <CheckCircle2 className="w-5 h-5 shrink-0 text-emerald-400 mt-0.5" />
+                      <div className="leading-relaxed">
+                        <p className="font-semibold text-emerald-200 mb-1">Password Reset Complete</p>
+                        <p>{resetSuccess}</p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setResetSuccess(null);
+                        setResetError(null);
+                        navigateAuth('/login', 'login');
+                      }}
+                      className="w-full bg-gradient-to-r from-indigo-600 via-emerald-600 to-teal-600 hover:from-indigo-500 hover:to-teal-500 text-white rounded-xl py-3 px-4 font-mono text-xs uppercase tracking-wider font-bold transition-all shadow-lg shadow-emerald-500/20 cursor-pointer border border-white/10 flex items-center justify-center gap-2"
+                    >
+                      <span>Proceed to Sign In →</span>
+                    </button>
+                  </div>
+                ) : (
+                  <form onSubmit={handleResetPassword} className="flex flex-col gap-4">
+                    {resetError && (
+                      <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs px-4 py-3 rounded-xl flex flex-col gap-1.5">
+                        <div className="flex items-center gap-2.5">
+                          <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                          <span>{resetError}</span>
+                        </div>
+                        {(resetError.toLowerCase().includes('expired') || resetError.toLowerCase().includes('invalid')) && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setResetError(null);
+                              navigateAuth('/forgot-password', 'forgot-password');
+                            }}
+                            className="text-[11px] font-mono text-rose-200 hover:underline self-start ml-6.5 cursor-pointer"
+                          >
+                            Request a new password reset link →
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {!new URLSearchParams(typeof window !== 'undefined' ? window.location.search : '').get('token') && !resetToken ? (
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-xs font-mono uppercase tracking-wider text-slate-400">Reset Token</label>
+                        <input
+                          type="text"
+                          required
+                          value={resetToken}
+                          onChange={(e) => setResetToken(e.target.value)}
+                          placeholder="Paste single-use token here"
+                          className="w-full bg-white/5 border border-white/15 rounded-xl px-4 py-3 text-white placeholder:text-slate-500 focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400 outline-none backdrop-blur-md text-sm font-mono"
+                        />
+                      </div>
+                    ) : (
+                      <div className="px-3.5 py-2.5 rounded-xl bg-white/5 border border-white/10 flex items-center justify-between text-xs font-mono text-slate-400">
+                        <span className="flex items-center gap-1.5 text-emerald-400">
+                          <Check className="w-3.5 h-3.5" />
+                          Single-Use Token Attached
+                        </span>
+                        <span className="text-[11px] text-slate-500 font-mono">
+                          {resetToken ? `${resetToken.slice(0, 8)}...${resetToken.slice(-6)}` : 'Verified'}
+                        </span>
+                      </div>
+                    )}
+
+                    <div className="flex flex-col gap-1.5 relative">
+                      <label className="text-xs font-mono uppercase tracking-wider text-slate-400">New Password</label>
+                      <div className="relative">
+                        <input
+                          type={showResetPassword ? 'text' : 'password'}
+                          required
+                          minLength={6}
+                          value={resetNewPassword}
+                          onChange={(e) => setResetNewPassword(e.target.value)}
+                          placeholder="At least 6 characters"
+                          className="w-full bg-white/5 border border-white/15 rounded-xl px-4 py-3 pr-10 text-white placeholder:text-slate-500 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 outline-none backdrop-blur-md text-sm"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowResetPassword(!showResetPassword)}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white cursor-pointer"
+                        >
+                          {showResetPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-1.5 relative">
+                      <label className="text-xs font-mono uppercase tracking-wider text-slate-400">Confirm New Password</label>
+                      <div className="relative">
+                        <input
+                          type={showConfirmPassword ? 'text' : 'password'}
+                          required
+                          minLength={6}
+                          value={resetConfirmPassword}
+                          onChange={(e) => setResetConfirmPassword(e.target.value)}
+                          placeholder="Re-enter your new password"
+                          className="w-full bg-white/5 border border-white/15 rounded-xl px-4 py-3 pr-10 text-white placeholder:text-slate-500 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 outline-none backdrop-blur-md text-sm"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white cursor-pointer"
+                        >
+                          {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="text-[11px] font-mono text-slate-400 flex items-center gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span>Must be at least 6 characters. Bcrypt hashed on server.</span>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={resetLoading}
+                      className="w-full bg-gradient-to-r from-indigo-600 via-emerald-600 to-teal-600 hover:from-indigo-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl py-3 px-4 font-mono text-xs uppercase tracking-wider font-bold transition-all shadow-lg shadow-emerald-500/20 cursor-pointer mt-2 border border-white/10 flex items-center justify-center gap-2"
+                    >
+                      {resetLoading ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          <span>Updating Credentials...</span>
+                        </>
+                      ) : (
+                        <span>Confirm & Reset Password</span>
+                      )}
+                    </button>
+
+                    <div className="pt-2 text-center">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setResetError(null);
+                          navigateAuth('/login', 'login');
+                        }}
+                        className="text-xs font-mono text-slate-400 hover:text-white transition-colors cursor-pointer"
+                      >
+                        Cancel & return to <span className="text-emerald-400 hover:underline">Sign In</span>
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            ) : authMode === 'verify-email' ? (
+              <div className="flex flex-col gap-6 animate-fadeIn bg-white/5 backdrop-blur-2xl p-8 rounded-3xl border border-white/10 shadow-2xl">
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigateAuth('/login', 'login');
+                  }}
+                  className="flex items-center gap-1.5 text-slate-400 hover:text-white text-xs font-mono transition-colors self-start cursor-pointer"
+                >
+                  ← Back to Sign In
+                </button>
+
+                <div className="flex items-center gap-3.5">
+                  <div className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 shadow-lg border ${
+                    verificationStatus === 'success'
+                      ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-emerald-500/10'
+                      : verificationStatus === 'error'
+                      ? 'bg-rose-500/20 text-rose-400 border-rose-500/30 shadow-rose-500/10'
+                      : 'bg-indigo-500/20 text-indigo-400 border-indigo-500/30 shadow-indigo-500/10'
+                  }`}>
+                    {verificationStatus === 'verifying' ? (
+                      <RefreshCw className="w-6 h-6 animate-spin text-emerald-400" />
+                    ) : verificationStatus === 'success' ? (
+                      <CheckCircle2 className="w-6 h-6 text-emerald-400" />
+                    ) : verificationStatus === 'error' ? (
+                      <AlertCircle className="w-6 h-6 text-rose-400" />
+                    ) : (
+                      <Mail className="w-6 h-6 text-indigo-400" />
+                    )}
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white mb-0.5">
+                      {verificationStatus === 'verifying'
+                        ? 'Verifying Email...'
+                        : verificationStatus === 'success'
+                        ? 'Email Verified!'
+                        : verificationStatus === 'error'
+                        ? 'Verification Link Issue'
+                        : 'Email Verification'}
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      {verificationStatus === 'success'
+                        ? 'Your FINTRACK account is active and verified.'
+                        : verificationStatus === 'error'
+                        ? 'The link could not be verified or has expired.'
+                        : 'Confirming your account credentials...'}
+                    </p>
+                  </div>
+                </div>
+
+                {verificationStatus === 'verifying' && (
+                  <div className="py-8 flex flex-col items-center justify-center gap-3 text-slate-300 font-mono text-xs">
+                    <RefreshCw className="w-8 h-8 animate-spin text-emerald-400" />
+                    <span>Validating single-use security token with server...</span>
+                  </div>
+                )}
+
+                {verificationStatus === 'success' && (
+                  <div className="flex flex-col gap-5">
+                    <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs px-4 py-3.5 rounded-xl flex items-start gap-3">
+                      <CheckCircle2 className="w-5 h-5 shrink-0 text-emerald-400 mt-0.5" />
+                      <div className="leading-relaxed">
+                        <p className="font-semibold text-emerald-200 mb-1">Account Ready</p>
+                        <p>{verificationMessage || 'Email verified successfully. You can now sign in.'}</p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigateAuth('/login', 'login');
+                      }}
+                      className="w-full bg-gradient-to-r from-emerald-600 via-teal-600 to-indigo-600 hover:from-emerald-500 hover:to-indigo-500 text-white rounded-xl py-3 px-4 font-mono text-xs uppercase tracking-wider font-bold transition-all shadow-lg shadow-emerald-500/20 cursor-pointer border border-white/10 flex items-center justify-center gap-2"
+                    >
+                      <span>Proceed to Sign In →</span>
+                    </button>
+                  </div>
+                )}
+
+                {verificationStatus === 'error' && (
+                  <div className="flex flex-col gap-5">
+                    <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs px-4 py-3.5 rounded-xl flex items-start gap-3">
+                      <AlertCircle className="w-5 h-5 shrink-0 text-rose-400 mt-0.5" />
+                      <div className="leading-relaxed">
+                        <p className="font-semibold text-rose-200 mb-1">Verification Link Invalid or Expired</p>
+                        <p>{verificationMessage || 'This verification link is invalid or has expired.'}</p>
+                      </div>
+                    </div>
+
+                    <form onSubmit={(e) => handleResendVerification(e)} className="flex flex-col gap-3">
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        Need a new verification link? Enter your email address below. <span className="text-amber-300 font-semibold">Note:</span> Requesting a new link invalidates any previous links, so please make sure to open the <strong className="text-white">newest email</strong> you receive.
+                      </p>
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-xs font-mono uppercase tracking-wider text-slate-400">Email Address</label>
+                        <input
+                          type="email"
+                          required
+                          value={resendEmail}
+                          onChange={(e) => setResendEmail(e.target.value)}
+                          placeholder="your-email@domain.com"
+                          className="w-full bg-white/5 border border-white/15 rounded-xl px-4 py-3 text-white placeholder:text-slate-500 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 outline-none backdrop-blur-md text-sm"
+                        />
+                      </div>
+
+                      {resendSuccess && (
+                        <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs px-3.5 py-2.5 rounded-xl">
+                          {resendSuccess}
+                        </div>
+                      )}
+
+                      {resendError && (
+                        <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs px-3.5 py-2.5 rounded-xl">
+                          {resendError}
+                        </div>
+                      )}
+
+                      <button
+                        type="submit"
+                        disabled={resendLoading}
+                        className="w-full bg-gradient-to-r from-indigo-600 via-emerald-600 to-teal-600 hover:from-indigo-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl py-3 px-4 font-mono text-xs uppercase tracking-wider font-bold transition-all shadow-lg shadow-emerald-500/20 cursor-pointer mt-1 border border-white/10 flex items-center justify-center gap-2"
+                      >
+                        {resendLoading ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                            <span>Sending Email...</span>
+                          </>
+                        ) : (
+                          <span>Resend Verification Email</span>
+                        )}
+                      </button>
+                    </form>
+
+                    <div className="text-center pt-2">
+                      <button
+                        type="button"
+                        onClick={() => navigateAuth('/login', 'login')}
+                        className="text-xs font-mono text-slate-400 hover:text-white transition-colors cursor-pointer"
+                      >
+                        Return to <span className="text-emerald-400 hover:underline">Sign In</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             ) : (
               <div className="flex flex-col gap-6 animate-fadeIn bg-white/5 backdrop-blur-2xl p-8 rounded-3xl border border-white/10 shadow-2xl">
                 <button
@@ -1460,6 +2179,10 @@ export default function App() {
                     onClick={() => {
                       setIsRegistering(false);
                       setLoginError(null);
+                      if (!loginEmail) {
+                        setLoginEmail(accountType === 'Corporate' ? 'admin@apexglobal.io' : 'alex.morgan@fintrack.io');
+                        setLoginPassword('fintrack2026');
+                      }
                     }}
                     className={`flex-1 py-1.5 rounded-lg text-xs font-mono uppercase tracking-wider font-semibold transition-all cursor-pointer ${
                       !isRegistering
@@ -1474,6 +2197,13 @@ export default function App() {
                     onClick={() => {
                       setIsRegistering(true);
                       setLoginError(null);
+                      // Clear demo credentials so customer enters their real email
+                      if (loginEmail === 'alex.morgan@fintrack.io' || loginEmail === 'admin@apexglobal.io') {
+                        setLoginEmail('');
+                      }
+                      if (loginPassword === 'fintrack2026') {
+                        setLoginPassword('');
+                      }
                     }}
                     className={`flex-1 py-1.5 rounded-lg text-xs font-mono uppercase tracking-wider font-semibold transition-all cursor-pointer ${
                       isRegistering
@@ -1485,10 +2215,42 @@ export default function App() {
                   </button>
                 </div>
 
+                {registeredEmailNotice && !isRegistering && (
+                  <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs px-4 py-3.5 rounded-xl flex flex-col gap-2">
+                    <div className="flex items-start gap-2.5">
+                      <Mail className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                      <div className="leading-relaxed">
+                        <p className="font-semibold text-white">Verification Email Sent!</p>
+                        <p>We've sent an activation link to <strong>{registeredEmailNotice}</strong>. Please check your inbox and verify your email to log in.</p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleResendVerification(undefined, registeredEmailNotice)}
+                      disabled={resendLoading}
+                      className="text-[11px] font-mono text-emerald-400 hover:text-emerald-300 underline self-start cursor-pointer"
+                    >
+                      {resendLoading ? 'Sending email...' : 'Did not receive it? Resend verification link →'}
+                    </button>
+                  </div>
+                )}
+
                 {loginError && (
-                  <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs px-4 py-3 rounded-xl flex items-center gap-2.5">
-                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
-                    <span>{loginError}</span>
+                  <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs px-4 py-3 rounded-xl flex flex-col gap-1.5">
+                    <div className="flex items-center gap-2.5">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                      <span>{loginError}</span>
+                    </div>
+                    {unverifiedLoginEmail && (
+                      <button
+                        type="button"
+                        onClick={() => handleResendVerification(undefined, unverifiedLoginEmail)}
+                        disabled={resendLoading}
+                        className="text-[11px] font-mono text-rose-300 hover:text-rose-200 underline self-start ml-6.5 cursor-pointer"
+                      >
+                        {resendLoading ? 'Sending email...' : `Resend verification link to ${unverifiedLoginEmail} →`}
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -1508,13 +2270,19 @@ export default function App() {
                   )}
 
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-xs font-mono uppercase tracking-wider text-slate-400">Username / Email</label>
+                    <label className="text-xs font-mono uppercase tracking-wider text-slate-400">
+                      {isRegistering ? 'Your Real Email Address' : 'Username / Email'}
+                    </label>
                     <input
                       type="email"
                       required
                       value={loginEmail}
                       onChange={(e) => setLoginEmail(e.target.value)}
-                      placeholder={accountType === 'Corporate' ? 'admin@apexglobal.io' : 'alex.morgan@fintrack.io'}
+                      placeholder={
+                        isRegistering
+                          ? (accountType === 'Corporate' ? 'company@yourdomain.com' : 'you@gmail.com')
+                          : (accountType === 'Corporate' ? 'admin@apexglobal.io' : 'alex.morgan@fintrack.io')
+                      }
                       className="w-full bg-white/5 border border-white/15 rounded-xl px-4 py-3 text-white placeholder:text-slate-500 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 outline-none backdrop-blur-md text-sm"
                     />
                   </div>
@@ -1546,7 +2314,19 @@ export default function App() {
                         <input type="checkbox" defaultChecked className="rounded bg-white/10 border-white/20 text-emerald-500 focus:ring-emerald-500" />
                         Remember Me
                       </label>
-                      <span className="text-[11px] text-slate-500 font-mono">Demo pwd: fintrack2026</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setForgotEmail(loginEmail);
+                          setForgotError(null);
+                          setForgotSuccess(null);
+                          setDevResetToken(null);
+                          navigateAuth('/forgot-password', 'forgot-password');
+                        }}
+                        className="text-xs font-mono text-emerald-400 hover:text-emerald-300 transition-colors cursor-pointer hover:underline"
+                      >
+                        Forgot Password?
+                      </button>
                     </div>
                   )}
 
@@ -1694,10 +2474,12 @@ export default function App() {
 
               {/* Amount */}
               <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-mono uppercase tracking-widest text-slate-400">Amount (₹)</label>
+                <label className="text-xs font-mono uppercase tracking-widest text-slate-400">
+                  Amount ({getCurrencyConfig(preferredCurrency).symbol})
+                </label>
                 <div className="relative">
-                  <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-lg font-bold text-slate-400">
-                    ₹
+                  <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-lg font-bold text-slate-400 font-mono">
+                    {getCurrencyConfig(preferredCurrency).symbol}
                   </span>
                   <input
                     type="number"
@@ -1868,7 +2650,7 @@ export default function App() {
                 <label className="text-xs font-mono uppercase tracking-widest text-slate-400">Monthly Limit Amount</label>
                 <div className="relative">
                   <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-slate-400 font-bold font-mono">
-                    ₹
+                    {getCurrencyConfig(preferredCurrency).symbol}
                   </span>
                   <input
                     type="number"
@@ -2354,6 +3136,23 @@ export default function App() {
               )}
             </div>
 
+            {/* Global Compact Currency Selector */}
+            <div className="relative flex items-center">
+              <select
+                value={preferredCurrency}
+                onChange={(e) => handleQuickCurrencyChange(e.target.value)}
+                aria-label="Select Currency"
+                title="Change Currency Preference"
+                className="bg-white/10 hover:bg-white/15 text-white text-xs font-mono font-bold py-1.5 px-2.5 rounded-xl border border-white/20 focus:border-emerald-400 focus:outline-none transition-all cursor-pointer backdrop-blur-md"
+              >
+                {SUPPORTED_CURRENCIES.map((c) => (
+                  <option key={c.code} value={c.code} className="bg-slate-900 text-white">
+                    {c.symbol} {c.code}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <div
               onClick={() => setCurrentTab('profile')}
               title="Open Profile"
@@ -2369,6 +3168,27 @@ export default function App() {
           {/* TAB 1: DASHBOARD */}
           {currentTab === 'dashboard' && (
             <>
+              {/* Dashboard Header Bar with Currency Selector */}
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pb-1">
+                <div>
+                  <h2 className="text-xl font-bold text-white tracking-tight">Financial Overview</h2>
+                  <p className="text-xs text-slate-400 font-mono">Real-time calculations across your active portfolio</p>
+                </div>
+                <div className="flex items-center gap-2 self-end sm:self-auto bg-white/5 border border-white/10 px-3 py-1.5 rounded-2xl backdrop-blur-md">
+                  <span className="text-[11px] font-mono text-slate-400 uppercase tracking-wider">Currency:</span>
+                  <select
+                    value={preferredCurrency}
+                    onChange={(e) => handleQuickCurrencyChange(e.target.value)}
+                    className="bg-transparent text-emerald-400 text-xs font-mono font-bold focus:outline-none cursor-pointer"
+                  >
+                    {SUPPORTED_CURRENCIES.map((c) => (
+                      <option key={c.code} value={c.code} className="bg-slate-900 text-white">
+                        {c.symbol} {c.code} — {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
               {/* Dashboard Error Alert */}
               {dashboardError && (
                 <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs p-4 rounded-2xl flex items-center justify-between gap-3 animate-slideIn">
@@ -2424,11 +3244,11 @@ export default function App() {
                     </div>
                     <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-mono text-xs font-semibold">
                       <TrendingUp className="w-3.5 h-3.5" />
-                      {dashboardSummary ? `Mo: ₹${(dashboardSummary.currentMonthIncome ?? 0).toLocaleString('en-IN')}` : 'Current Mo'}
+                      {dashboardSummary ? `Mo: ${formatCurrency(dashboardSummary.currentMonthIncome ?? 0, preferredCurrency)}` : 'Current Mo'}
                     </span>
                   </div>
                   <p className="text-xs font-mono uppercase tracking-wider text-slate-400 mb-1">Total Income</p>
-                  <h3 className="text-2xl font-bold text-white tracking-tight">₹{(effectiveIncome ?? 0).toLocaleString('en-IN')}</h3>
+                  <h3 className="text-2xl font-bold text-white tracking-tight">{formatCurrency(effectiveIncome ?? 0, preferredCurrency)}</h3>
                 </div>
 
                 {/* Total Expenses */}
@@ -2439,11 +3259,11 @@ export default function App() {
                     </div>
                     <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 border border-rose-500/30 font-mono text-xs font-semibold">
                       <TrendingUp className="w-3.5 h-3.5" />
-                      {dashboardSummary ? `Mo: ₹${(dashboardSummary.currentMonthExpenses ?? 0).toLocaleString('en-IN')}` : 'Current Mo'}
+                      {dashboardSummary ? `Mo: ${formatCurrency(dashboardSummary.currentMonthExpenses ?? 0, preferredCurrency)}` : 'Current Mo'}
                     </span>
                   </div>
                   <p className="text-xs font-mono uppercase tracking-wider text-slate-400 mb-1">Total Expenses</p>
-                  <h3 className="text-2xl font-bold text-white tracking-tight">₹{effectiveExpense.toLocaleString('en-IN')}</h3>
+                  <h3 className="text-2xl font-bold text-white tracking-tight">{formatCurrency(effectiveExpense, preferredCurrency)}</h3>
                 </div>
 
                 {/* Balance */}
@@ -2462,7 +3282,7 @@ export default function App() {
                   </div>
                   <p className="text-xs font-mono uppercase tracking-wider text-slate-400 mb-1">Balance</p>
                   <h3 className={`text-2xl font-bold tracking-tight ${effectiveBalance >= 0 ? 'text-white' : 'text-rose-400'}`}>
-                    ₹{effectiveBalance.toLocaleString('en-IN')}
+                    {formatCurrency(effectiveBalance, preferredCurrency)}
                   </h3>
                 </div>
 
@@ -2522,11 +3342,7 @@ export default function App() {
 
                       <div className="absolute flex flex-col items-center justify-center text-center">
                         <span className="text-xl font-bold text-white">
-                          {effectiveExpense >= 100000 
-                            ? `₹${(effectiveExpense / 100000).toFixed(1)}L` 
-                            : effectiveExpense >= 1000 
-                              ? `₹${(effectiveExpense / 1000).toFixed(1)}k` 
-                              : `₹${effectiveExpense.toLocaleString('en-IN')}`}
+                          {formatCurrency(effectiveExpense, preferredCurrency, { compact: true })}
                         </span>
                         <span className="text-[10px] font-mono uppercase text-slate-400">Total Spent</span>
                       </div>
@@ -2547,7 +3363,7 @@ export default function App() {
                             <span className="text-slate-300 truncate" title={slice.category}>{slice.category}</span>
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
-                            <span className="text-slate-400 text-[11px]">₹{slice.amount.toLocaleString('en-IN')}</span>
+                            <span className="text-slate-400 text-[11px]">{formatCurrency(slice.amount, preferredCurrency)}</span>
                             <span className="font-bold text-white w-9 text-right">{slice.percentage}%</span>
                           </div>
                         </div>
@@ -2563,7 +3379,7 @@ export default function App() {
                     <div className="flex justify-between items-center mb-4 pb-3 border-b border-white/10">
                       <h4 className="text-lg font-bold text-white">Monthly Spending</h4>
                       <span className="text-xs font-mono text-emerald-400 font-medium bg-emerald-500/10 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
-                        {dashboardSummary ? `Current Mo: ₹${dashboardSummary.currentMonthExpenses.toLocaleString('en-IN')}` : 'Average ₹38,200/mo'}
+                        {dashboardSummary ? `Current Mo: ${formatCurrency(dashboardSummary.currentMonthExpenses, preferredCurrency)}` : `Average ${formatCurrency(38200, preferredCurrency)}/mo`}
                       </span>
                     </div>
 
@@ -2576,7 +3392,7 @@ export default function App() {
                         monthlySpendingData.map((item, idx) => {
                           const pct = item.amount > 0 ? Math.max(12, Math.round((item.amount / maxMonthlySpend) * 100)) : 6;
                           const color = barColors[idx % barColors.length];
-                          const formattedVal = `₹${item.amount.toLocaleString('en-IN')}`;
+                          const formattedVal = formatCurrency(item.amount, preferredCurrency);
                           return (
                             <div key={item.key || idx} className="flex-1 flex flex-col items-center gap-2 h-full justify-end group">
                               <div className="relative w-full flex items-end justify-center">
@@ -2649,7 +3465,7 @@ export default function App() {
                                     tx.type === 'income' ? 'text-emerald-400' : 'text-slate-100'
                                   }`}
                                 >
-                                  {tx.type === 'income' ? '+' : '-'}₹{tx.amount.toLocaleString('en-IN')}
+                                  {tx.type === 'income' ? '+' : '-'}{formatCurrency(tx.amount, preferredCurrency)}
                                 </td>
                               </tr>
                             ))
@@ -2705,7 +3521,7 @@ export default function App() {
                     <label className="text-xs font-mono uppercase tracking-widest text-slate-400">Amount</label>
                     <div className="relative">
                       <span className="absolute inset-y-0 left-0 pl-4 flex items-center text-2xl font-bold text-slate-400">
-                        ₹
+                        {getCurrencyConfig(preferredCurrency).symbol}
                       </span>
                       <input
                         type="number"
@@ -2993,19 +3809,19 @@ export default function App() {
                       <div className="bg-white/5 rounded-2xl p-3.5 border border-white/5">
                         <span className="text-[10px] font-mono uppercase text-slate-400 block mb-0.5">Net Balance</span>
                         <span className="text-lg font-bold text-white">
-                          ₹{effectiveBalance.toLocaleString('en-IN')}
+                          {formatCurrency(effectiveBalance, preferredCurrency)}
                         </span>
                       </div>
                       <div className="bg-white/5 rounded-2xl p-3.5 border border-white/5">
                         <span className="text-[10px] font-mono uppercase text-slate-400 block mb-0.5">Total Income</span>
                         <span className="text-lg font-bold text-emerald-400">
-                          ₹{effectiveIncome.toLocaleString('en-IN')}
+                          {formatCurrency(effectiveIncome, preferredCurrency)}
                         </span>
                       </div>
                       <div className="bg-white/5 rounded-2xl p-3.5 border border-white/5">
                         <span className="text-[10px] font-mono uppercase text-slate-400 block mb-0.5">Total Outflow</span>
                         <span className="text-lg font-bold text-rose-400">
-                          ₹{effectiveExpense.toLocaleString('en-IN')}
+                          {formatCurrency(effectiveExpense, preferredCurrency)}
                         </span>
                       </div>
                       <div className="bg-white/5 rounded-2xl p-3.5 border border-white/5">
@@ -3404,7 +4220,7 @@ export default function App() {
                     <TrendingDown className="w-4 h-4 text-rose-400" />
                   </div>
                   <div className="text-2xl font-bold font-mono text-rose-400 mt-2">
-                    ₹{filteredExpenseTotal.toLocaleString('en-IN')}
+                    {formatCurrency(filteredExpenseTotal, preferredCurrency)}
                   </div>
                   <span className="text-[11px] text-slate-400 font-mono mt-0.5 block">
                     {filteredTransactions.filter((t) => t.type === 'expense').length} expense transactions
@@ -3417,7 +4233,7 @@ export default function App() {
                     <TrendingUp className="w-4 h-4 text-emerald-400" />
                   </div>
                   <div className="text-2xl font-bold font-mono text-emerald-400 mt-2">
-                    ₹{filteredIncomeTotal.toLocaleString('en-IN')}
+                    {formatCurrency(filteredIncomeTotal, preferredCurrency)}
                   </div>
                   <span className="text-[11px] text-slate-400 font-mono mt-0.5 block">
                     {filteredTransactions.filter((t) => t.type === 'income').length} income streams
@@ -3430,7 +4246,7 @@ export default function App() {
                     <Wallet className="w-4 h-4 text-indigo-400" />
                   </div>
                   <div className={`text-2xl font-bold font-mono mt-2 ${filteredNetBalance >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {filteredNetBalance >= 0 ? '+' : ''}₹{filteredNetBalance.toLocaleString('en-IN')}
+                    {formatCurrency(filteredNetBalance, preferredCurrency, { showPlusSign: true })}
                   </div>
                   <span className="text-[11px] text-slate-400 font-mono mt-0.5 block">
                     Net cash flow in view scope
@@ -3443,7 +4259,7 @@ export default function App() {
                     <SlidersHorizontal className="w-4 h-4 text-teal-400" />
                   </div>
                   <div className="text-2xl font-bold font-mono text-white mt-2">
-                    ₹{filteredTransactions.length > 0 ? Math.round((filteredExpenseTotal + filteredIncomeTotal) / filteredTransactions.length).toLocaleString('en-IN') : 0}
+                    {formatCurrency(filteredTransactions.length > 0 ? Math.round((filteredExpenseTotal + filteredIncomeTotal) / filteredTransactions.length) : 0, preferredCurrency)}
                   </div>
                   <span className="text-[11px] text-slate-400 font-mono mt-0.5 block">
                     Across {filteredTransactions.length} active records
@@ -3652,7 +4468,7 @@ export default function App() {
                                 t.type === 'income' ? 'text-emerald-400' : 'text-slate-100'
                               }`}
                             >
-                              {t.type === 'income' ? '+' : '-'}₹{t.amount.toLocaleString('en-IN')}
+                              {t.type === 'income' ? '+' : '-'}{formatCurrency(t.amount, preferredCurrency)}
                             </td>
                             <td className="p-3.5 text-center whitespace-nowrap">
                               <div className="flex items-center justify-center gap-1.5">
@@ -3765,27 +4581,27 @@ export default function App() {
                       <div className="bg-white/5 backdrop-blur-xl rounded-2xl p-5 border border-white/10 shadow-lg">
                         <span className="text-xs font-mono uppercase text-slate-400">Total Inflow</span>
                         <div className="text-2xl font-bold font-mono text-emerald-400 mt-1">
-                          ₹{totalInflow.toLocaleString('en-IN')}
+                          {formatCurrency(totalInflow, preferredCurrency)}
                         </div>
                         <span className="text-[11px] text-slate-400 font-mono mt-1 block">
-                          Avg ₹{avgInflow.toLocaleString('en-IN')}/mo
+                          Avg {formatCurrency(avgInflow, preferredCurrency)}/mo
                         </span>
                       </div>
 
                       <div className="bg-white/5 backdrop-blur-xl rounded-2xl p-5 border border-white/10 shadow-lg">
                         <span className="text-xs font-mono uppercase text-slate-400">Total Outflow</span>
                         <div className="text-2xl font-bold font-mono text-rose-400 mt-1">
-                          ₹{totalOutflow.toLocaleString('en-IN')}
+                          {formatCurrency(totalOutflow, preferredCurrency)}
                         </div>
                         <span className="text-[11px] text-slate-400 font-mono mt-1 block">
-                          Avg ₹{avgOutflow.toLocaleString('en-IN')}/mo
+                          Avg {formatCurrency(avgOutflow, preferredCurrency)}/mo
                         </span>
                       </div>
 
                       <div className="bg-white/5 backdrop-blur-xl rounded-2xl p-5 border border-white/10 shadow-lg">
                         <span className="text-xs font-mono uppercase text-slate-400">Net Wealth Generated</span>
                         <div className={`text-2xl font-bold font-mono mt-1 ${netSavingsVal >= 0 ? 'text-teal-300' : 'text-rose-400'}`}>
-                          ₹{netSavingsVal.toLocaleString('en-IN')}
+                          {formatCurrency(netSavingsVal, preferredCurrency)}
                         </div>
                         <span className="text-[11px] text-slate-400 font-mono mt-1 block">
                           Savings Rate: {savingsRateVal}%
@@ -3795,7 +4611,7 @@ export default function App() {
                       <div className="bg-white/5 backdrop-blur-xl rounded-2xl p-5 border border-white/10 shadow-lg">
                         <span className="text-xs font-mono uppercase text-slate-400">Projected Annual Net</span>
                         <div className="text-2xl font-bold font-mono text-indigo-300 mt-1">
-                          ₹{projectedAnnualVal.toLocaleString('en-IN')}
+                          {formatCurrency(projectedAnnualVal, preferredCurrency)}
                         </div>
                         <span className="text-[11px] text-slate-400 font-mono mt-1 block">
                           Expense/Income: {expenseRatioVal}%
@@ -3856,20 +4672,20 @@ export default function App() {
                                           <div
                                             style={{ height: `${incomePct}%` }}
                                             className="w-1/2 max-w-[20px] rounded-t-lg bg-emerald-400/90 group-hover:brightness-125 transition-all shadow-md shadow-emerald-500/10"
-                                            title={`Income: ₹${inc.toLocaleString('en-IN')}`}
+                                            title={`Income: ${formatCurrency(inc, preferredCurrency)}`}
                                           />
                                           {/* Expense Bar */}
                                           <div
                                             style={{ height: `${expensePct}%` }}
                                             className="w-1/2 max-w-[20px] rounded-t-lg bg-rose-400/90 group-hover:brightness-125 transition-all shadow-md shadow-rose-500/10"
-                                            title={`Expense: ₹${exp.toLocaleString('en-IN')}`}
+                                            title={`Expense: ${formatCurrency(exp, preferredCurrency)}`}
                                           />
 
                                           {/* Hover Tooltip */}
                                           <div className="absolute -top-12 bg-[#020617] text-white p-2 rounded-xl text-[10px] font-mono border border-white/20 opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-20 shadow-2xl">
-                                            <div className="text-emerald-400">+₹{inc.toLocaleString('en-IN')}</div>
-                                            <div className="text-rose-400">-₹{exp.toLocaleString('en-IN')}</div>
-                                            <div className="text-slate-400 border-t border-white/10 mt-1 pt-0.5">Net: ₹{net.toLocaleString('en-IN')}</div>
+                                            <div className="text-emerald-400">+{formatCurrency(inc, preferredCurrency)}</div>
+                                            <div className="text-rose-400">-{formatCurrency(exp, preferredCurrency)}</div>
+                                            <div className="text-slate-400 border-t border-white/10 mt-1 pt-0.5">Net: {formatCurrency(net, preferredCurrency, { showPlusSign: true })}</div>
                                           </div>
                                         </div>
                                         <span className="text-[11px] font-mono text-slate-400 truncate w-full text-center">
@@ -3919,7 +4735,7 @@ export default function App() {
                                       {cat.category}
                                     </span>
                                     <div className="flex items-center gap-2">
-                                      <span className="text-slate-400">₹{cat.amount.toLocaleString('en-IN')}</span>
+                                      <span className="text-slate-400">{formatCurrency(cat.amount, preferredCurrency)}</span>
                                       <span className="font-bold text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20 text-[10px]">
                                         {cat.percentage}%
                                       </span>
@@ -4013,10 +4829,10 @@ export default function App() {
                       <span className="text-xs font-mono uppercase tracking-widest text-slate-400">Total Monthly Utilization ({budgetPeriod})</span>
                       <div className="flex items-baseline gap-3">
                         <span className="text-3xl font-bold font-mono text-white">
-                          ₹{(budgetSummary?.totalSpent ?? 0).toLocaleString('en-IN')}
+                          {formatCurrency(budgetSummary?.totalSpent ?? 0, preferredCurrency)}
                         </span>
                         <span className="text-sm font-mono text-slate-400">
-                          of ₹{(budgetSummary?.totalBudgeted ?? 0).toLocaleString('en-IN')} budgeted
+                          of {formatCurrency(budgetSummary?.totalBudgeted ?? 0, preferredCurrency)} budgeted
                         </span>
                       </div>
                     </div>
@@ -4025,7 +4841,7 @@ export default function App() {
                       <div className="text-right">
                         <span className="text-xs font-mono uppercase text-slate-400 block">Remaining Buffer</span>
                         <span className={`text-xl font-bold font-mono ${(budgetSummary?.remainingTotal ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {(budgetSummary?.remainingTotal ?? 0) >= 0 ? '₹' + (budgetSummary?.remainingTotal ?? 0).toLocaleString('en-IN') : '-₹' + Math.abs(budgetSummary?.remainingTotal ?? 0).toLocaleString('en-IN')}
+                          {formatCurrency(budgetSummary?.remainingTotal ?? 0, preferredCurrency)}
                         </span>
                       </div>
 
@@ -4133,10 +4949,10 @@ export default function App() {
                           {/* Consumption Stats */}
                           <div className="flex items-baseline justify-between mt-3 mb-2 font-mono">
                             <span className="text-xl font-bold text-white">
-                              ₹{(b.spent ?? 0).toLocaleString('en-IN')}
+                              {formatCurrency(b.spent ?? 0, preferredCurrency)}
                             </span>
                             <span className="text-xs text-slate-400">
-                              Cap: ₹{(b.amount ?? 0).toLocaleString('en-IN')}
+                              Cap: {formatCurrency(b.amount ?? 0, preferredCurrency)}
                             </span>
                           </div>
 
@@ -4170,7 +4986,7 @@ export default function App() {
                           </span>
 
                           <span className={`text-[11px] font-medium ${isExceeded ? 'text-rose-400 font-bold' : 'text-slate-300'}`}>
-                            {(b.remaining ?? 0) >= 0 ? `₹${(b.remaining ?? 0).toLocaleString('en-IN')} buffer` : `₹${Math.abs(b.remaining ?? 0).toLocaleString('en-IN')} over`}
+                            {(b.remaining ?? 0) >= 0 ? `${formatCurrency(b.remaining ?? 0, preferredCurrency)} buffer` : `${formatCurrency(Math.abs(b.remaining ?? 0), preferredCurrency)} over`}
                           </span>
                         </div>
                       </div>
@@ -4364,6 +5180,37 @@ export default function App() {
                     </div>
                     <p className="text-[11px] text-slate-500 font-mono">Tier established during account provisioning.</p>
                   </div>
+
+                  {/* Editable: Preferred Currency */}
+                  <div className="flex flex-col gap-2 md:col-span-2">
+                    <label className="text-xs font-mono uppercase tracking-wider text-slate-300 flex items-center justify-between">
+                      <span className="flex items-center gap-1.5">
+                        <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Preferred Currency</span>
+                        <span className="text-emerald-400">*</span>
+                      </span>
+                      <span className="text-[10px] text-slate-400 font-mono">
+                        Global display preference
+                      </span>
+                    </label>
+                    <div className="relative">
+                      <select
+                        disabled={profileLoading || profileSaving}
+                        value={editCurrency}
+                        onChange={(e) => setEditCurrency(e.target.value)}
+                        className="w-full bg-[#0f172a] border border-white/15 rounded-xl px-4 py-3 text-white focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 outline-none text-sm transition-colors disabled:opacity-50 font-mono cursor-pointer"
+                      >
+                        {SUPPORTED_CURRENCIES.map((c) => (
+                          <option key={c.code} value={c.code} className="bg-[#0f172a] text-white">
+                            {c.symbol} {c.code} — {c.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <p className="text-[11px] text-slate-400 font-mono">
+                      Controls how monetary values are displayed across Dashboard, Transactions, Analytics, Budgets, and Reports.
+                    </p>
+                  </div>
                 </div>
 
                 {/* Form Action Buttons */}
@@ -4375,6 +5222,7 @@ export default function App() {
                       if (profile) {
                         setEditName(profile.name);
                         setEditPhone(profile.phone || '');
+                        setEditCurrency(profile.currency || DEFAULT_CURRENCY);
                         setProfileError(null);
                       }
                     }}

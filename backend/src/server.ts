@@ -13,6 +13,7 @@ import budgetRoutes from './routes/budgets.js';
 import aiRoutes from './routes/ai.js';
 import supportRoutes from './routes/support.js';
 import notificationRoutes from './routes/notifications.js';
+import { verifyEmailConnection } from './services/email.service.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,6 +21,8 @@ const __dirname = path.dirname(__filename);
 // Load backend .env, then root .env if present
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+
+verifyEmailConnection();
 
 const app = express();
 

@@ -33,6 +33,7 @@ export interface AuthUser {
   name: string;
   email: string;
   accountType: AccountType;
+  currency?: string;
 }
 
 export interface AuthResponse {
@@ -251,6 +252,22 @@ export const authApi = {
 
   async getCurrentUser(): Promise<{ success: boolean; user: AuthUser }> {
     return api.get<{ success: boolean; user: AuthUser }>('/auth/me');
+  },
+
+  async forgotPassword(email: string): Promise<{ success: boolean; message: string; [key: string]: any }> {
+    return api.post('/auth/forgot-password', { email });
+  },
+
+  async resetPassword(token: string, newPassword: string): Promise<{ success: boolean; message: string }> {
+    return api.post('/auth/reset-password', { token, newPassword });
+  },
+
+  async verifyEmail(token: string): Promise<{ success: boolean; message: string }> {
+    return api.post('/auth/verify-email', { token });
+  },
+
+  async resendVerification(email: string): Promise<{ success: boolean; message: string; [key: string]: any }> {
+    return api.post('/auth/resend-verification', { email });
   }
 };
 
@@ -260,12 +277,14 @@ export interface UserProfile {
   email: string;
   accountType: AccountType;
   phone: string;
+  currency: string;
   createdAt: string;
 }
 
 export interface UpdateProfileData {
   name?: string;
   phone?: string;
+  currency?: string;
 }
 
 export interface ProfileResponse {
